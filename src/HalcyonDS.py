@@ -8,11 +8,13 @@ import PyTango
 import Superlogics8080_control as sc
 import u12
 import threading
+import logging
 import time
 import numpy as np
 from socket import gethostname
 import Queue
 
+logging.basicConfig(level=logging.INFO)
 
 class HalcyonCommand:
     def __init__(self, command, data=None):
@@ -36,6 +38,170 @@ class PicomotorFollowParameters(object):
         self.moveSteps = 2
         self.maxNumberAdjusts = 5
         self.adjustNumber = 0
+
+class HalcyonTracking(object):
+    def __init__(self, cmdQueue):
+        # Configuration parameters:
+        self.follow = False
+        self.search = False
+        self.maxPiezoVoltage = 70
+        self.minPiezoVoltage = 30
+        self.updateDeadtime = 2.0
+        self.moveSteps = 2
+        self.maxNumberAdjusts = 5  # Maximum number of adjusts of picomotor before going back to idle
+        self.maxNumberFailedAdjusts = 3  # Maxmimum number of adjusts that overflowed the maxNumberAdjusts before declaring the lock non-functional
+        self.picomotorAverageTime = 60.0  # Collecting picomotor positions with this rolling window time
+        
+        self.q = cmdQueue
+        
+        # Current values
+        self.lastUpdateTime = time.time()
+        self.adjustNumber = 0
+        self.failedAdjustNumber = 0
+        self.errorFrequency = None
+        self.jitter = None
+        self.errorFrequencyHistory = []
+        self.piezoVoltage = 0.0
+        self.modelock = False
+        self.picomotorHistory = [(self.lastUpdateTime, 0)]
+        self.lockdown = False
+        
+        # State machine settings
+        self.halcyonState = 'nomodelock'
+        self.prevState = self.halcyonState
+        self.stateHandlerDict = {'idle': self.idleHandler,
+                        'nomodelock': self.noModelockHandler,
+                        'nofreqlock': self.noFreqLockHandler,
+                        'adjusting': self.adjustingHandler,
+                        'searching': self.searchingHandler}
+
+        
+    def stateHandlerDispatcher(self):
+        """Handles switch of states in the state machine thread.
+        Each state handled method should exit by setting the next state,
+        going back to this method. The previous state is also included when
+        calling the next state handler method.
+        The thread is stopped by setting the stopStateThreadFlag.
+        """
+        try:
+            self.stateHandlerDict[self.halcyonState]()
+            if self.halcyonState != self.prevState:
+                self.prevState = self.halcyonState
+        except KeyError:
+            self.stateHandlerDict['nomodelock']()
+            if self.halcyonState != self.prevState:
+                self.prevState = self.halcyonState
+        
+    def idleHandler(self):
+        logging.info('Entering idleHandler')
+        if self.modelock == False:
+            self.halcyonState = 'nomodelock'
+        elif self.errorFrequency > 0:
+            self.halcyonState = 'nofreqlock'
+        elif self.piezoVoltage < self.minPiezoVoltage or self.piezoVoltage > self.maxPiezoVoltage:
+            logging.info('Idle: Piezo in adjust range')
+            if self.follow == True:
+                if self.lockdown == True:
+                    # If the device was in lockdown mode
+                    # and then was turned back to follow (someone issued 
+                    # wrote follow=True) we exit lockdown mode.
+                    self.lockdown = False
+                    cmdMsg = HalcyonCommand('on')
+                    self.q.put(cmdMsg)
+                logging.info('Following')
+                self.adjustNumber = 0
+                self.halcyonState = 'adjusting'
+            else:
+                logging.info('Not following')
+
+    def noModelockHandler(self):
+        logging.info('Entering noModeLockHandler')
+        if self.modelock == True:
+            self.halcyonState = 'nofreqlock'
+            
+    def noFreqLockHandler(self):
+        logging.info('Entering noFreqLockHandler')
+        if self.modelock == False:
+            self.halcyonState = 'nomodelock'
+        elif self.errorFrequency == 0:
+            self.halcyonState = 'idle'
+        elif self.search == True:
+            self.halcyonState = 'searching'
+
+    def lockdownHandler(self):
+        # Too many adjustment attempts where made. Do not exit this state
+        # until the oscillator drops out of modelock or state is forcibly changed
+        # from the outside.
+        # 
+        # The reason for coming to this state is probably that the device has lost
+        # either the 3 GHz RF signal or the photodiode signal.
+        #
+        logging.info('Entering lockdownHandler')
+        if self.modelock == False:
+            self.halcyonState = 'nomodelock'
+            
+    def adjustingHandler(self):
+        logging.info('Entering adjustingHandler')
+        logging.info(''.join(('Adjustment #', str(self.adjustNumber))))
+        if self.modelock == False:
+            self.halcyonState = 'nomodelock'
+        elif self.errorFrequency > 0:
+            self.halcyonState = 'nofreqlock'
+        elif self.follow == True:
+            if self.adjustNumber < self.maxNumberAdjusts:
+                logging.info('Adjustment number ok')
+                t = time.time()
+                if t - self.lastUpdateTime > self.updateDeadtime:
+                    logging.info('Adjustment time ok')
+                    self.adjustNumber += 1
+                    self.lastUpdateTime = t
+                    # Only keep adjusting if we are outside a +- 5 range of center:
+                    if np.abs(self.piezoVoltage - 50) > 5:
+                        logging.info('Adjustment voltage in range')
+                        if np.abs(self.piezoVoltage) > 1:
+                            # If the piezo voltage is too low there is a problem,
+                            # probably a missing signal
+                            if self.piezoVoltage < 50:
+                                cmdMsg = HalcyonCommand('writeMotorPositionRelative', -self.moveSteps)
+                                self.picomotorHistory.append((t, self.picomotorHistory[-1][1] - self.moveSteps))
+                            else:
+                                cmdMsg = HalcyonCommand('writeMotorPositionRelative', self.moveSteps)
+                                self.picomotorHistory.append((t, self.picomotorHistory[-1][1] + self.moveSteps))
+                            self.q.put(cmdMsg)
+                            if self.picomotorHistory[-1][0] - self.picomotorHistory[0][0] > self.picomotorAverageTime:
+                                self.picomotorHistory.pop(0) 
+                    else:
+                        # In range. Reset adjustNumber and failedAdjustNumber
+                        self.adjustNumber = 0
+                        self.failedAdjustNumber = 0
+                        self.halcyonState = 'idle'
+            else:
+                # Reached max number of adjusts
+                self.adjustNumber = 0
+                self.failedAdjustNumber += 1
+                self.halcyonState = 'idle'  # Not enough attempts, have another go
+                if self.failedAdjustNumber > self.maxNumberFailedAdjusts:
+                            # Too many adjustment attempts where made. Entering lockdown. Do not exit 
+                            # this mode until someone issues a writes True to follow attribute.
+                            # 
+                            # The reason for coming to this mode is probably that the device has lost
+                            # either the 3 GHz RF signal or the photodiode signal.
+                            #
+                    self.follow = False
+                    self.lockdown = True
+                    self.failedAdjustNumber = 0
+                    cmdMsg = HalcyonCommand('alarm')
+                    self.q.put(cmdMsg)
+
+        
+    def searchingHandler(self):
+        logging.info('Entering searchingHandler')
+        if self.modelock == False:
+            self.halcyonState = 'nomodelock'
+        elif self.errorFrequency == 0:
+            self.halcyonState = 'idle'
+
+
 
 #==================================================================
 #   HalcyonDS Class Description:
@@ -105,10 +271,25 @@ class HalcyonDS(PyTango.Device_4Impl):
         self.commandQueue = Queue.Queue(100)
         self.labjackList = []
 
+        try:
+            self.halcyonTracking = HalcyonTracking(self.commandQueue)
+            self.halcyonTracking.maxNumberAdjusts = 10
+            self.halcyonTracking.updateDeadtime = 1
+            self.halcyonTracking.minPiezoVoltage = 30
+            self.halcyonTracking.maxPiezoVoltage = 70
+        except:            
+            self.halcyonTracking = HalcyonTracking(self.commandQueue)
+    #                self.halcyonTracking.follow = False
+            self.halcyonTracking.maxNumberAdjusts = 10
+            self.halcyonTracking.updateDeadtime = 1
+            self.halcyonTracking.minPiezoVoltage = 30
+            self.halcyonTracking.maxPiezoVoltage = 70
+        
+
         self.stateHandlerDict = {PyTango.DevState.ON: self.onHandler,
                                 PyTango.DevState.MOVING: self.onHandler,
                                 PyTango.DevState.ALARM: self.onHandler,
-                                PyTango.DevState.FAULT: self.faultHandler,
+                                PyTango.DevState.FAULT: self.onHandler,
                                 PyTango.DevState.INIT: self.initHandler,
                                 PyTango.DevState.UNKNOWN: self.unknownHandler,
                                 PyTango.DevState.OFF: self.offHandler}
@@ -244,13 +425,12 @@ class HalcyonDS(PyTango.Device_4Impl):
                 with self.streamLock:
                     self.info_stream('Trying to connect...')
                 self.errorFrequency = 0
-                self.piezoVolatage = 0
+                self.piezoVoltage = 0
                 self.modelock = False
                 self.picomotorPosition = 0
                 self.errorTrace = np.zeros(4000)
                 self.jitter = 0.0
                 self.sampleTime = 1 / 1.5625e7
-
 
             except Exception, e:
                 with self.streamLock:
@@ -293,54 +473,62 @@ class HalcyonDS(PyTango.Device_4Impl):
         """
         with self.streamLock:
             self.info_stream('Entering onHandler')
-        handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING]
+        handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING, PyTango.DevState.FAULT]
         waitTime = 0.1
         self.set_status('On')
         while self.stopStateThreadFlag == False:
+            self.info_stream('onhandler loop')
             with self.attrLock:
                 state = self.get_state()
             if state not in handledStates:
                 break
             # Read piezo voltage and modelock status from labjack
             with self.attrLock:
+                self.info_stream('Checking devices')
                 if self.commandQueue.empty() == True:
                     try:
                         data = self.labjackDevice.aiSample(2, [0, 1], self.labjackIndex)['voltages']
+                        self.info_stream('labjack ok')
+                        self.piezoVoltage = data[0] * 10
+                        if data[1] > 3:
+                            self.modelock = True
+                        else:
+                            self.modelock = False
                     except Exception, e:
                         with self.streamLock:
                             self.error_stream(''.join(('Error reading labjack: ', str(e))))
                             self.set_state(PyTango.DevState.FAULT)
-                            break
-                    self.piezoVoltage = data[0] * 10
-                    if data[1] > 3:
-                        self.modelock = True
-                    else:
-                        self.modelock = False
+                            self.modelock = None
+                            self.piezoVoltage = None
+                            
             # Read error frequency from frequency counter
             with self.attrLock:
                 try:
                     self.errorFrequency = self.frequencyDevice.getFrequency()
+                    self.info_stream('error frequency ok')
                 except Exception, e:
                     with self.streamLock:
                         self.error_stream(''.join(('Error reading frequency counter: ', str(e))))
                         self.set_state(PyTango.DevState.FAULT)
-                        break
+                        self.errorFrequency = None
             # Read picomotor position from picomotor (this might not be needed...)
             with self.attrLock:
-                try:
+                try:                    
                     data = self.picomotorDevice.read_attribute('MotorPosition0A1')
                     if data.quality == PyTango.AttrQuality.ATTR_INVALID:
                         self.set_state(PyTango.DevState.FAULT)
-                        break
-                    self.picomotorPosition = data.value
+                        self.picomotorPosition = None
+                    else:
+                        self.picomotorPosition = data.value
+                        self.info_stream('picomotor ok')
                 except Exception, e:
                     with self.streamLock:
                         self.error_stream('Error reading picomotor position')
                         self.error_stream(str(e))
                     self.set_state(PyTango.DevState.FAULT)
-                    break
-            if self.picomotorFollowParameters.follow == True:
-                self.picomotorFollowFunction()
+                    self.picomotorPosition = None
+#             if self.picomotorFollowParameters.follow == True:
+#                 self.picomotorFollowFunction()
             
             # Read redpitaya:
             with self.attrLock:
@@ -348,19 +536,28 @@ class HalcyonDS(PyTango.Device_4Impl):
                     if self.redpitayaChannel == 1:
                         data = self.redpitayaDevice.read_attribute('waveform1')
                     else:        
+                        self.info_stream('Reading waveform 2')
                         data = self.redpitayaDevice.read_attribute('waveform2')
+                    self.info_stream('redpitaya ok')
+                    self.errorTrace = data.value
+                    # Jitter calculation according to kmlabs white paper
+                    fref = 2.9985e9
+                    Vpp = 0.8                
+                    self.jitter = 1 / (2 * np.pi * fref) * self.errorTrace.std() / (Vpp / 2) 
                 except Exception, e:
                     with self.streamLock:
                         self.error_stream('Error reading redpitaya')
                         self.error_stream(str(e))
                     self.set_state(PyTango.DevState.FAULT)
-                    break
-            with self.attrLock:
-                self.errorTrace = data.value
-                fref = 2.9985e9
-                Vpp = 0.5                
-                self.jitter = 1 / (2 * np.pi * fref) * self.errorTrace.std() / (Vpp / 2) 
+                    self.errorTrace = None
+                    self.jitter = None
             
+            self.halcyonTracking.modelock = self.modelock
+            self.halcyonTracking.jitter = self.jitter
+            self.halcyonTracking.errorFrequency = self.errorFrequency
+            self.halcyonTracking.piezoVoltage = self.piezoVoltage
+            self.halcyonTracking.stateHandlerDispatcher()
+                        
             self.checkCommands(blockTime=waitTime)
 
 
@@ -507,11 +704,20 @@ class HalcyonDS(PyTango.Device_4Impl):
 
             elif cmd.command == 'off':
                 if self.get_state() not in [PyTango.DevState.INIT, PyTango.DevState.UNKNOWN]:
-                    self.setState(PyTango.DevState.OFF)
+                    self.set_state(PyTango.DevState.OFF)
 
             elif cmd.command == 'init':
                 if self.get_state() not in [PyTango.DevState.UNKNOWN]:
-                    self.setState(PyTango.DevState.UNKNOWN)
+                    self.set_state(PyTango.DevState.UNKNOWN)
+                    
+            elif cmd.command == 'alarm':
+                if self.get_state() not in [PyTango.DevState.UNKNOWN]:
+                    self.set_state(PyTango.DevState.ALARM)
+
+            elif cmd.command == 'on':
+                if self.get_state() not in [PyTango.DevState.UNKNOWN]:
+                    self.set_state(PyTango.DevState.ON)
+                    
 
         except Queue.Empty:
 #             with self.streamLock:
@@ -581,7 +787,8 @@ class HalcyonDS(PyTango.Device_4Impl):
         with self.streamLock:
             self.info_stream(''.join(('Reading picomotor follow')))
         with self.attrLock:
-            attr_read = self.picomotorFollowParameters.follow
+#            attr_read = self.picomotorFollowParameters.follow
+            attr_read = self.halcyonTracking.follow
             if attr_read == None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = 0.0
@@ -591,7 +798,10 @@ class HalcyonDS(PyTango.Device_4Impl):
         self.info_stream(''.join(('Writing picomotor follow')))
         with self.attrLock:
             data = (attr.get_write_value())
-            self.picomotorFollowParameters.follow = data
+#            self.picomotorFollowParameters.follow = data
+            self.info_stream(''.join(('Setting halcyonTracking.follow to ', str(data))))
+            self.halcyonTracking.follow = data
+            self.set_state(PyTango.DevState.ON)
 
     def is_PicomotorFollow_allowed(self, req_type):
         if self.get_state() in []:
