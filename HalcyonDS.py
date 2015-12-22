@@ -289,7 +289,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         self.stateHandlerDict = {PyTango.DevState.ON: self.onHandler,
                                 PyTango.DevState.MOVING: self.onHandler,
                                 PyTango.DevState.ALARM: self.onHandler,
-                                PyTango.DevState.FAULT: self.faultHandler,
+                                PyTango.DevState.FAULT: self.onHandler,
                                 PyTango.DevState.INIT: self.initHandler,
                                 PyTango.DevState.UNKNOWN: self.unknownHandler,
                                 PyTango.DevState.OFF: self.offHandler}
@@ -473,7 +473,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         """
         with self.streamLock:
             self.info_stream('Entering onHandler')
-        handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING]
+        handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING, PyTango.DevState.FAULT]
         waitTime = 0.1
         self.set_status('On')
         while self.stopStateThreadFlag == False:
@@ -487,43 +487,49 @@ class HalcyonDS(PyTango.Device_4Impl):
                 self.info_stream('Checking devices')
                 if self.commandQueue.empty() == True:
                     try:
+                        self.info_stream('labjack check')
                         data = self.labjackDevice.aiSample(2, [0, 1], self.labjackIndex)['voltages']
                         self.info_stream('labjack ok')
+                        self.piezoVoltage = data[0] * 10
+                        if data[1] > 3:
+                            self.modelock = True
+                        else:
+                            self.modelock = False
                     except Exception, e:
                         with self.streamLock:
                             self.error_stream(''.join(('Error reading labjack: ', str(e))))
                             self.set_state(PyTango.DevState.FAULT)
-                            break
-                    self.piezoVoltage = data[0] * 10
-                    if data[1] > 3:
-                        self.modelock = True
-                    else:
-                        self.modelock = False
+                            self.modelock = None
+                            self.piezoVoltage = None
+                            
             # Read error frequency from frequency counter
             with self.attrLock:
                 try:
+                    self.info_stream('error frequency checl')
                     self.errorFrequency = self.frequencyDevice.getFrequency()
                     self.info_stream('error frequency ok')
                 except Exception, e:
                     with self.streamLock:
                         self.error_stream(''.join(('Error reading frequency counter: ', str(e))))
                         self.set_state(PyTango.DevState.FAULT)
-                        break
+                        self.errorFrequency = None
             # Read picomotor position from picomotor (this might not be needed...)
             with self.attrLock:
-                try:                    
+                try:      
+                    self.info_stream('picomotor check')              
                     data = self.picomotorDevice.read_attribute('MotorPosition0A1')
                     if data.quality == PyTango.AttrQuality.ATTR_INVALID:
                         self.set_state(PyTango.DevState.FAULT)
-                        break
-                    self.picomotorPosition = data.value
-                    self.info_stream('picomotor ok')
+                        self.picomotorPosition = None
+                    else:
+                        self.picomotorPosition = data.value
+                        self.info_stream('picomotor ok')
                 except Exception, e:
                     with self.streamLock:
                         self.error_stream('Error reading picomotor position')
                         self.error_stream(str(e))
                     self.set_state(PyTango.DevState.FAULT)
-                    break
+                    self.picomotorPosition = None
 #             if self.picomotorFollowParameters.follow == True:
 #                 self.picomotorFollowFunction()
             
@@ -536,25 +542,25 @@ class HalcyonDS(PyTango.Device_4Impl):
                         self.info_stream('Reading waveform 2')
                         data = self.redpitayaDevice.read_attribute('waveform2')
                     self.info_stream('redpitaya ok')
+                    self.errorTrace = data.value
+                    # Jitter calculation according to kmlabs white paper
+                    fref = 2.9985e9
+                    Vpp = 0.8                
+                    self.jitter = 1 / (2 * np.pi * fref) * self.errorTrace.std() / (Vpp / 2) 
                 except Exception, e:
                     with self.streamLock:
                         self.error_stream('Error reading redpitaya')
                         self.error_stream(str(e))
                     self.set_state(PyTango.DevState.FAULT)
-                    break
-            with self.attrLock:
-                self.errorTrace = data.value
-                # Jitter calculation according to kmlabs white paper
-                fref = 2.9985e9
-                Vpp = 0.8                
-                self.jitter = 1 / (2 * np.pi * fref) * self.errorTrace.std() / (Vpp / 2) 
+                    self.errorTrace = None
+                    self.jitter = None
             
             self.halcyonTracking.modelock = self.modelock
             self.halcyonTracking.jitter = self.jitter
             self.halcyonTracking.errorFrequency = self.errorFrequency
             self.halcyonTracking.piezoVoltage = self.piezoVoltage
             self.halcyonTracking.stateHandlerDispatcher()
-            
+                        
             self.checkCommands(blockTime=waitTime)
 
 
@@ -857,6 +863,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         with self.streamLock:
             self.info_stream(''.join(('Reading jitter')))
         with self.attrLock:
+            self.info_stream(''.join(('Jitter: ', str(self.jitter))))
             attr_read = self.jitter
             q = PyTango.AttrQuality.ATTR_VALID
             if attr_read == None:
