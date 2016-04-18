@@ -672,6 +672,8 @@ class HalcyonDS(PyTango.Device_4Impl):
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = 0.0
+            elif attr_read is False:
+                attr.set_quality(PyTango.AttrQuality.ATTR_ALARM)
             attr.set_value(attr_read)
 
     def is_Modelocked_allowed(self, req_type):
