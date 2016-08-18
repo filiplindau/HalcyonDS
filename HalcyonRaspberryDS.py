@@ -289,7 +289,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         """
         with self.streamLock:
             self.info_stream('Entering onHandler')
-        handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING, PyTango.DevState.FAULT]
+        handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING]
         waitTime = 0.1
         self.waitingForVoltage = False
         self.waitingForPicomotor = False
@@ -432,9 +432,70 @@ class HalcyonDS(PyTango.Device_4Impl):
         retries = 0
         maxTries = 5
 
+        # Will try to communicate with all devices
         while self.stopStateThreadFlag is False:
             if self.get_state() not in handledStates:
                 break
+
+            # Starting with picomotor
+            with self.streamLock:
+                self.info_stream('Testing picomotor')
+            with self.attrLock:
+                try:
+                    st = self.picomotorDevice.state()
+                    if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
+                        self.set_state(PyTango.DevState.ON)
+                    else:
+                        self.info_stream(''.join(('Device state: ', str(st))))
+                except Exception, ex:
+                    self.error_stream(''.join(('Picomotor error, going to unknown state', str(ex))))
+                    self.set_state(PyTango.DevState.UNKNOWN)
+                    break
+
+            # Testing redpitaya
+            with self.streamLock:
+                self.info_stream('Testing redpitaya')
+            with self.attrLock:
+                try:
+                    st = self.redpitayaDevice.state()
+                    if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
+                        self.set_state(PyTango.DevState.ON)
+                    else:
+                        self.info_stream(''.join(('Device state: ', str(st))))
+                except Exception, ex:
+                    self.error_stream(''.join(('Redpitaya error, going to unknown state', str(ex))))
+                    self.set_state(PyTango.DevState.UNKNOWN)
+                    break
+
+            # Testing ad7991
+            with self.streamLock:
+                self.info_stream('Testing AD7991')
+            with self.attrLock:
+                try:
+                    st = self.ad7991Device.state()
+                    if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
+                        self.set_state(PyTango.DevState.ON)
+                    else:
+                        self.info_stream(''.join(('Device state: ', str(st))))
+                except Exception, ex:
+                    self.error_stream(''.join(('AD7991 error, going to unknown state', str(ex))))
+                    self.set_state(PyTango.DevState.UNKNOWN)
+                    break
+
+            # Testing superlogics
+            with self.streamLock:
+                self.info_stream('Testing superlogics')
+            with self.attrLock:
+                try:
+                    st = self.frequencyDevice.state()
+                    if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
+                        self.set_state(PyTango.DevState.ON)
+                    else:
+                        self.info_stream(''.join(('Device state: ', str(st))))
+                except Exception, ex:
+                    self.error_stream(''.join(('Supelogics error, going to unknown state', str(ex))))
+                    self.set_state(PyTango.DevState.UNKNOWN)
+                    break
 
             if self.get_state() == PyTango.DevState.FAULT:
                 retries += 1
