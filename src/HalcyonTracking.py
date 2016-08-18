@@ -163,7 +163,9 @@ class HalcyonTracking(object):
             self.failedAdjustNumber = 0
             cmdMsg = HalcyonCommand('on')
             self.q.put(cmdMsg)
+            self.halcyonState = 'nofreqlock'        # Go to nofreqlock even if we are frequency locked. It will then switch to idle state next pass
         else:
+            # Remain in lockdown until someone switches to follow
             cmdMsg = HalcyonCommand('alarm', 'Adjustment lockdown. Too many attempts.')
             self.q.put(cmdMsg)
 
