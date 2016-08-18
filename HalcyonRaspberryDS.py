@@ -291,6 +291,11 @@ class HalcyonDS(PyTango.Device_4Impl):
             self.info_stream('Entering onHandler')
         handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING, PyTango.DevState.FAULT]
         waitTime = 0.1
+        self.waitingForVoltage = False
+        self.waitingForPicomotor = False
+        self.waitingForModelock = False
+        self.waitingForFrequency = False
+        self.waitingForPicomotor = False
         self.set_status('On')
         while self.stopStateThreadFlag is False:
             self.info_stream('onhandler loop')
@@ -299,7 +304,7 @@ class HalcyonDS(PyTango.Device_4Impl):
             if state not in handledStates:
                 break
 
-            self.waitingForVoltage = False
+
             if self.commandQueue.empty() is True:
 
                 with self.attrLock:
