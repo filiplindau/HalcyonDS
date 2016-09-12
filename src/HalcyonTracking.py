@@ -49,8 +49,8 @@ class HalcyonTracking(object):
         self.centerPiezoVoltage = 50
         self.piezoDeadband = 10
         self.updateDeadtime = 2.0
-        self.moveSteps = 2
-        self.maxNumberAdjusts = 5  # Maximum number of adjusts of picomotor before going back to idle
+        self.moveSteps = 1
+        self.maxNumberAdjusts = 20  # Maximum number of adjusts of picomotor before going back to idle
         self.maxNumberFailedAdjusts = 10  # Maxmimum number of adjusts that overflowed the maxNumberAdjusts before declaring the lock non-functional
         self.picomotorAverageTime = 60.0  # Collecting picomotor positions with this rolling window time
 
@@ -172,6 +172,7 @@ class HalcyonTracking(object):
     def adjustingHandler(self):
         logging.info('Entering adjustingHandler')
         logging.info(''.join(('Adjustment #', str(self.adjustNumber))))
+        t0 = time.time()
         if self.modelock is False or self.modelock is None:
             self.halcyonState = 'nomodelock'
         elif self.errorFrequency > 0 or self.errorFrequency is None:
@@ -227,6 +228,7 @@ class HalcyonTracking(object):
                     self.failedAdjustNumber = 0
                     cmdMsg = HalcyonCommand('alarm', 'Entering lockdown')
                     self.q.put(cmdMsg)
+            logging.info("Adjustment time spent: {:.1f}s".format(time.time() - t0))
 
     def searchingHandler(self):
         """ Function for searching out a frequency lock by moving the picomotor
