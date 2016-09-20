@@ -11,6 +11,7 @@ import time
 import numpy as np
 import Queue
 from HalcyonTracking import HalcyonCommand, HalcyonTracking, PicomotorFollowParameters
+from AttributeReadThreadClass import AttributeClass
 
 logging.basicConfig(format='%(asctime)s - %(module)s.   %(funcName)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -45,17 +46,17 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     Device destructor
 # ------------------------------------------------------------------
     def delete_device(self):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(("[Device delete_device method] for device", self.get_name())))
-        self.stopThread()
+        self.stop_thread()
 
 
 # ------------------------------------------------------------------
 #     Device initialization
 # ------------------------------------------------------------------
     def init_device(self):
-        self.streamLock = threading.Lock()
-        with self.streamLock:
+        self.stream_lock = threading.Lock()
+        with self.stream_lock:
             self.info_stream(''.join(("In ", self.get_name(), "::init_device()")))
         self.set_state(PyTango.DevState.UNKNOWN)
         self.get_device_properties(self.get_device_class())
@@ -63,7 +64,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         # Try stopping the stateThread if it was started before. Will fail if this
         # is the initial start.
         try:
-            self.stopThread()
+            self.stop_thread()
 
         except Exception:
             pass
@@ -73,42 +74,58 @@ class HalcyonDS(PyTango.Device_4Impl):
         except:
             self.picomotorFollowParameters = PicomotorFollowParameters()
 
-        self.attrLock = threading.Lock()
-        self.eventIdList = []
-        self.stateThread = threading.Thread()
-        threading.Thread.__init__(self.stateThread, target=self.stateHandlerDispatcher)
+        self.attributes = {}
+        self.devices = {}
 
-        self.commandQueue = Queue.Queue(100)
+        self.attr_lock = threading.Lock()
+        self.eventIdList = []
+        self.state_thread = threading.Thread()
+        threading.Thread.__init__(self.state_thread, target=self.stateHandlerDispatcher)
+
+        self.command_queue = Queue.Queue(100)
+
+        self.attributeTimeout = 3.0
+        self.waitingForPicomotorWrite = False
+        self.waitingForPicomotorId = None
+
+        # Load up property values from the database:
+        try:
+            self.halcyon_tracking = HalcyonTracking(self.command_queue)
+            self.halcyon_tracking.updateDeadtime = 1
+            self.halcyon_tracking.minPiezoVoltage = self.piezoLowVoltage
+            self.halcyon_tracking.maxPiezoVoltage = self.piezoHighVoltage
+            self.halcyon_tracking.centerPiezoVoltage = (self.piezoHighVoltage + self.piezoLowVoltage) / 2.0
+            self.info_stream('Using {0} piezoHighVoltage'.format(self.piezoHighVoltage))
+        except:
+            self.halcyon_tracking = HalcyonTracking(self.command_queue)
+    #                self.halcyonTracking.follow = False
+            self.halcyon_tracking.updateDeadtime = 1
+            self.halcyon_tracking.minPiezoVoltage = 30
+            self.halcyon_tracking.maxPiezoVoltage = 70
+            self.halcyon_tracking.centerPiezoVoltage = (self.piezoHighVoltage + self.piezoLowVoltage) / 2.0
 
         try:
-            self.halcyonTracking = HalcyonTracking(self.commandQueue, self.attrLock)
-            self.halcyonTracking.maxNumberAdjusts = 15
-            self.halcyonTracking.updateDeadtime = 1
-            self.halcyonTracking.minPiezoVoltage = self.piezoLowVoltage
-            self.halcyonTracking.maxPiezoVoltage = self.piezoHighVoltage
-            self.halcyonTracking.centerPiezoVoltage = (self.piezoHighVoltage+self.piezoLowVoltage)/2.0
-            self.halcyonTracking.piezoDeadband = self.piezoDeadBand
+            self.halcyon_tracking.maxNumberAdjusts = self.maxNumberAdjusts
+            self.info_stream('Using {0} maxNumberAdjusts'.format(self.maxNumberAdjusts))
         except:
-            self.halcyonTracking = HalcyonTracking(self.commandQueue, self.attrLock)
-    #                self.halcyonTracking.follow = False
-            self.halcyonTracking.maxNumberAdjusts = 15
-            self.halcyonTracking.updateDeadtime = 1
-            self.halcyonTracking.minPiezoVoltage = 30
-            self.halcyonTracking.maxPiezoVoltage = 70
-            self.halcyonTracking.piezoDeadband = 10
-            self.halcyonTracking.centerPiezoVoltage = (self.piezoHighVoltage + self.piezoLowVoltage) / 2.0
+            self.halcyon_tracking.maxNumberAdjusts = 30
 
-        self.stateHandlerDict = {PyTango.DevState.ON: self.onHandler,
-                                 PyTango.DevState.MOVING: self.onHandler,
-                                 PyTango.DevState.ALARM: self.onHandler,
-                                 PyTango.DevState.FAULT: self.onHandler,
-                                 PyTango.DevState.INIT: self.initHandler,
-                                 PyTango.DevState.UNKNOWN: self.unknownHandler,
-                                 PyTango.DevState.OFF: self.offHandler}
+        try:
+            self.halcyon_tracking.piezoDeadband = self.piezoDeadBand
+        except:
+            self.halcyon_tracking.piezoDeadband = 10
 
-        self.stopStateThreadFlag = False
+        self.stateHandlerDict = {PyTango.DevState.ON: self.on_handler,
+                                 PyTango.DevState.MOVING: self.on_handler,
+                                 PyTango.DevState.ALARM: self.on_handler,
+                                 PyTango.DevState.FAULT: self.on_handler,
+                                 PyTango.DevState.INIT: self.init_handler,
+                                 PyTango.DevState.UNKNOWN: self.unknown_handler,
+                                 PyTango.DevState.OFF: self.off_handler}
 
-        self.stateThread.start()
+        self.stop_state_thread_flag = False
+
+        self.state_thread.start()
 
     def stateHandlerDispatcher(self):
         """Handles switch of states in the state machine thread.
@@ -118,7 +135,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         The thread is stopped by setting the stopStateThreadFlag.
         """
         prevState = self.get_state()
-        while self.stopStateThreadFlag is False:
+        while self.stop_state_thread_flag is False:
             try:
                 self.stateHandlerDict[self.get_state()](prevState)
                 prevState = self.get_state()
@@ -126,76 +143,110 @@ class HalcyonDS(PyTango.Device_4Impl):
                 self.stateHandlerDict[PyTango.DevState.UNKNOWN](prevState)
                 prevState = self.get_state()
 
-    def stopThread(self):
+    def stop_thread(self):
         """Stops the state handler thread by setting the stopStateThreadFlag
         """
-        self.stopStateThreadFlag = True
-        self.stateThread.join(3)
+        self.stop_state_thread_flag = True
+        self.state_thread.join(3)
         try:
-            self.frequencyDevice.close()
+            for attr_c in self.attributes:
+                self.info_stream(''.join(('Stopping thread ', str(attr_c.name))))
+                attr_c.stop_read()
         except:
             pass
 
-    def unknownHandler(self, prevState):
+    def unknown_handler(self, prevState):
         """Handles the UNKNOWN state, before communication with the hardware devices
         has been established. Here all devices are initialized.
         """
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream('Entering unknownHandler')
-        connectionTimeout = 1.0
+        connection_timeout = 1.0
         self.set_status('Connecting to frequency counter, labjack, and picomotor')
 
-        # Need to connect to frequency counter, ad7991,
+        # Need to connect to frequency counter, ad7991, redpitaya
         # and picomotor
 
-        while self.stopStateThreadFlag is False:
+        while self.stop_state_thread_flag is False:
             # AD7991:
             try:
-                self.ad7991Device = PyTango.DeviceProxy(self.ad7991DeviceName)
+                self.devices['ad7991'] = PyTango.DeviceProxy(self.ad7991DeviceName)
             except Exception, ex:
-                with self.streamLock:
+                with self.stream_lock:
                     self.error_stream(''.join(('Could not create ad7991 device ', str(self.ad7991DeviceName))))
                     self.error_stream(str(ex))
-                self.checkCommands(blockTime=connectionTimeout)
+                self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create ad7991 device')
+            try:
+                self.attributes['modelock'].stop_read()
+            except KeyError:
+                pass
+            self.attributes['modelock'] = AttributeClass(''.join(('channel', str(self.ad7991ModelockChannel))),
+                                                         self.devices['ad7991'], 0.3)
+            try:
+                self.attributes['piezo_voltage'].stop_read()
+            except KeyError:
+                pass
+            self.attributes['piezo_voltage'] = AttributeClass(''.join(('channel', str(self.ad7991PiezoChannel))),
+                                                              self.devices['ad7991'], 0.3)
 
             # Frequency counter:
             try:
-                self.frequencyDevice = PyTango.DeviceProxy(self.frequencyDeviceName)
+                self.devices['frequency'] = PyTango.DeviceProxy(self.frequencyDeviceName)
             except Exception, ex:
-                with self.streamLock:
-                    self.error_stream(''.join(('Could not create Frequency counter device ', str(self.frequencyDeviceName))))
+                with self.stream_lock:
+                    self.error_stream(''.join(('Could not create Frequency counter device ',
+                                               str(self.frequencyDeviceName))))
                     self.error_stream(str(ex))
-                self.checkCommands(blockTime=connectionTimeout)
+                self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create frequency counter device')
+            try:
+                self.attributes['error_frequency'].stop_read()
+            except KeyError:
+                pass
+            self.attributes['error_frequency'] = AttributeClass('frequency', self.devices['frequency'], 0.3)
 
             # Picomotor
             try:
-                self.picomotorDevice = PyTango.DeviceProxy(self.picomotorDeviceName)
+                self.devices['picomotor'] = PyTango.DeviceProxy(self.picomotorDeviceName)
             except Exception, ex:
-                with self.streamLock:
+                with self.stream_lock:
                     self.error_stream(''.join(('Could not create picomotor device ', str(self.picomotorDeviceName))))
                     self.error_stream(str(ex))
-                self.checkCommands(blockTime=connectionTimeout)
+                self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create picomotor device')
+            try:
+                self.attributes['picomotor'].stop_read()
+            except KeyError:
+                pass
+            self.attributes['picomotor'] = AttributeClass('MotorPosition0A1', self.devices['picomotor'], 0.3)
 
             # RedPitaya
             try:
-                self.redpitayaDevice = PyTango.DeviceProxy(self.redpitayaDeviceName)
+                self.devices['redpitaya'] = PyTango.DeviceProxy(self.redpitayaDeviceName)
             except Exception, ex:
-                with self.streamLock:
+                with self.stream_lock:
                     self.error_stream(''.join(('Could not create redpitaya device ', str(self.redpitayaDeviceName))))
                     self.error_stream(str(ex))
-                self.checkCommands(blockTime=connectionTimeout)
+                self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create redpitaya device')
+            try:
+                self.attributes['redpitaya'].stop_read()
+            except KeyError:
+                pass
+            if self.redpitayaChannel == 1:
+                self.attributes['redpitaya'] = AttributeClass('waveform1', self.devices['redpitaya'], 0.3)
+            else:
+                self.attributes['redpitaya'] = AttributeClass('waveform2', self.devices['redpitaya'], 0.3)
+
             self.set_state(PyTango.DevState.INIT)
             break
 
-    def initHandler(self, prevState):
+    def init_handler(self, prevState):
         """Handles the INIT state. Query Halcyon device to see if it is alive.
         """
-        with self.streamLock:
-            self.info_stream('Entering initHandler')
+        with self.stream_lock:
+            self.info_stream('Entering init_handler')
         waitTime = 1.0
         self.set_status('Initializing devices')
         retries = 0
@@ -205,242 +256,186 @@ class HalcyonDS(PyTango.Device_4Impl):
         if apiutil.get_asynch_cb_sub_model() != PyTango.cb_sub_model.PUSH_CALLBACK:
             apiutil.set_asynch_cb_sub_model(PyTango.cb_sub_model.PUSH_CALLBACK)
 
-        while self.stopStateThreadFlag is False:
+        while self.stop_state_thread_flag is False:
             retries += 1
             if retries > maxTries:
                 self.set_state(PyTango.DevState.UNKNOWN)
                 break
 
             # Init parameters and variables
-            self.errorFrequency = 0
-            self.waitingForFrequency = False
-            self.piezoVoltage = 0
-            self.waitingForVoltage = False
+            self.error_frequency = 0
+            self.piezo_voltage = 0
             self.modelock = False
-            self.waitingForModelock = False
-            self.picomotorPosition = 0
-            self.waitingForPicomotor = False
-            self.errorTrace = np.zeros(4000)
-            self.waitingForRedpitaya = False
+            self.picomotor_position = 0
+            self.error_trace = np.zeros(4000)
             self.jitter = 0.0
-            self.sampleTime = 1 / 1.5625e7
+            self.sample_time = 1 / 1.5625e7
 
-            # Init frequency counter by testing read
-            try:
-                with self.streamLock:
-                    self.info_stream('Reading frequency')
-                with self.attrLock:
-                    self.errorFrequency = self.frequencyDevice.read_attribute('frequency')
-            except Exception, ex:
-                self.error_stream('Error reading error frequency')
-                self.error_stream(''.join((ex)))
-                self.checkCommands(blockTime=waitTime)
+            # Init frequency counter
+            pass
 
             # Init ad7991
             try:
-                with self.streamLock:
+                with self.stream_lock:
                     self.info_stream('Initializing AD7991')
-                with self.attrLock:
-                    self.ad7991Device.write_attribute('voltagereference', 'vcc')
-                    self.piezoVoltage = self.ad7991Device.read_attribute(''.join(('channel', str(self.ad7991PiezoChannel))))
-                    modelockVoltage = self.ad7991Device.read_attribute(''.join(('channel', str(self.ad7991ModelockChannel))))
-                    if modelockVoltage > 2.0:
-                        self.modelock = True
-                    else:
-                        self.modelock = False
+                with self.attr_lock:
+                    self.devices['ad7991'].write_attribute('voltagereference', 'vcc')
             except Exception, ex:
-                self.error_stream('Error reading error frequency')
+                self.error_stream('Error writing ad7991 voltage reference')
                 self.error_stream(''.join((ex)))
-                self.checkCommands(blockTime=waitTime)
+                self.append_status('Error writing ad7991 voltage reference', True)
+                # noinspection PyTypeChecker
+                self.check_commands(block_time=waitTime)
 
             # Init picomotor (could write speed here)
-            try:
-                with self.streamLock:
-                    self.info_stream('Reading picomotor position')
-                with self.attrLock:
-                    self.picomotorPosition = self.picomotorDevice.read_attribute('MotorPosition0A1')
-            except Exception, ex:
-                self.error_stream('Error reading picomotor position')
-                self.error_stream(''.join((ex)))
-                self.checkCommands(blockTime=waitTime)
+            pass
 
             # Init redpitaya (write record length and samplerate)
             try:
-                with self.streamLock:
+                with self.stream_lock:
                     self.info_stream('Setting up redpitaya')
-                with self.attrLock:
-                    self.redpitayaDevice.command_inout('stop')
-                    self.redpitayaDevice.write_attribute('samplerate', 1 / self.sampleTime)
-                    self.redpitayaDevice.write_attribute('recordlength', 4000)
-                    self.redpitayaDevice.command_inout('start')
+                with self.attr_lock:
+                    self.devices['redpitaya'].command_inout('stop')
+                    self.devices['redpitaya'].write_attribute('samplerate', 1 / self.sample_time)
+                    self.devices['redpitaya'].write_attribute('recordlength', 4000)
+                    self.devices['redpitaya'].command_inout('start')
             except Exception, ex:
-                with self.streamLock:
-                    self.error_stream(''.join(('Error when initializing device')))
+                with self.stream_lock:
+                    self.error_stream(''.join(('Error when initializing redpitaya')))
                     self.error_stream(str(ex))
-                self.checkCommands(blockTime=waitTime)
+                    self.append_status('Error when initializing redpitaya', True)
+                self.check_commands(block_time=waitTime)
 
-            self.halcyonTracking.halcyonState = 'idle'
+            self.halcyon_tracking.halcyonState = 'idle'
             self.set_state(PyTango.DevState.ON)
             break
 
-    def onHandler(self, prevState):
+    def on_handler(self, prevState):
         """Handles the ON state. Connected to the Halcyon driver.
         Waits in a loop checking commands.
         """
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream('Entering onHandler')
-        handledStates = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING]
-        waitTime = 0.1
-        self.waitingForVoltage = False
-        self.waitingForPicomotor = False
-        self.waitingForModelock = False
-        self.waitingForFrequency = False
-        self.waitingForPicomotor = False
+        handled_states = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING]
+        wait_time = 0.1
         self.set_status('On')
-        while self.stopStateThreadFlag is False:
+        while self.stop_state_thread_flag is False:
             self.info_stream('onhandler loop')
-            with self.attrLock:
+            with self.attr_lock:
                 state = self.get_state()
-            if state not in handledStates:
+            if state not in handled_states:
                 break
 
-
-            if self.commandQueue.empty() is True:
-
-                with self.attrLock:
-                    self.info_stream('Checking devices')
-                    try:
-                        self.info_stream('ad7991 check')
-                        attr = self.ad7991Device.read_attribute(''.join(('channel', str(self.ad7991PiezoChannel))))
+            if self.command_queue.empty() is True:
+                self.info_stream('Checking devices')
+                # Modelock status
+                if self.attributes['modelock'].read_event.is_set():
+                        attr = self.attributes['modelock'].get_attribute()
                         if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                            self.piezoVoltage = attr.value * 100
+                            with self.attr_lock:
+                                if attr.value > 2.0:
+                                    self.modelock = True
+                                else:
+                                    self.modelock = False
                         else:
-                            self.piezoVoltage = None
+                            self.error_stream('Error reading modelock')
                             self.set_state(PyTango.DevState.FAULT)
+                            self.set_status('Error reading modelock')
+                            self.modelock = None
 
-                        attr = self.ad7991Device.read_attribute(''.join(('channel', str(self.ad7991ModelockChannel))))
-                        if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                            if attr.value > 2.0:
-                                self.modelock = True
-                            else:
-                                self.modelock = False
-                        else:
-                            self.modelock = None
-                            self.set_state(PyTango.DevState.FAULT)
-                        # if self.waitingForVoltage is False:
-                        #     self.ad7991Device.read_attribute_asynch(''.join(('channel', str(self.ad7991PiezoChannel))),
-                        #                                              self.updatePiezovoltage)
-                        #     self.waitingForVoltage = True
-                    except Exception, ex:
-                        with self.streamLock:
-                            self.error_stream(''.join(('Error reading ad7991: ', str(ex))))
-                            self.set_state(PyTango.DevState.FAULT)
-                        with self.attrLock:
-                            self.modelock = None
-                            self.piezoVoltage = None
+                # Piezo voltage
+                if self.attributes['piezo_voltage'].read_event.is_set():
+                    attr = self.attributes['piezo_voltage'].get_attribute()
+                    if attr.quality == PyTango.AttrQuality.ATTR_VALID:
+                        with self.attr_lock:
+                            self.piezo_voltage = attr.value * 100
+                    else:
+                        self.error_stream('Error reading piezo voltage')
+                        self.set_state(PyTango.DevState.FAULT)
+                        self.set_status('Error reading piezo voltage')
+                        self.piezo_voltage = None
 
                 # Read error frequency from frequency counter
-                with self.attrLock:
-                    try:
-                        self.info_stream('error frequency check')
-                        attr = self.frequencyDevice.read_attribute('frequency')
-                        if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                            self.errorFrequency = attr.value
-                        else:
-                            self.errorFrequency = None
-                            self.set_state(PyTango.DevState.FAULT)
-
-                        # if self.waitingForFrequency is False:
-                        #     self.frequencyDevice.read_attribute_asynch('frequency', self.updateFrequency)
-                        #     self.waitingForFrequency = True
-                    except Exception, ex:
-                        with self.streamLock:
-                            self.error_stream(''.join(('Error reading frequency counter: ', str(ex))))
-                            self.set_state(PyTango.DevState.FAULT)
-                            self.errorFrequency = None
+                if self.attributes['error_frequency'].read_event.is_set():
+                    attr = self.attributes['error_frequency'].get_attribute()
+                    if attr.quality == PyTango.AttrQuality.ATTR_VALID:
+                        with self.attr_lock:
+                            self.error_frequency = attr.value
+                    else:
+                        self.error_stream('Error reading error frequency')
+                        self.set_state(PyTango.DevState.FAULT)
+                        self.set_status('Error reading error frequency')
+                        self.error_frequency = None
 
                 # Read picomotor position from picomotor
-                with self.attrLock:
-                    try:
-                        self.info_stream('picomotor check')
-                        attr = self.picomotorDevice.read_attribute('MotorPosition0A1')
-                        if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                            self.picomotorPosition = attr.value
-                        else:
-                            self.picomotorPosition = None
-                            self.set_state(PyTango.DevState.FAULT)
-                        # if self.waitingForPicomotor is False:
-                        #     self.picomotorDevice.read_attribute_asynch('MotorPosition0A1', self.updatePicomotor)
-                        #     self.waitingForPicomotor = True
-                    except Exception, ex:
-                        with self.streamLock:
-                            self.error_stream('Error reading picomotor position')
-                            self.error_stream(str(ex))
+                if self.attributes['picomotor'].read_event.is_set():
+                    attr = self.attributes['picomotor'].get_attribute()
+                    if attr.quality == PyTango.AttrQuality.ATTR_VALID:
+                        with self.attr_lock:
+                            self.picomotor_position = attr.value
+                    else:
+                        self.error_stream('Error reading picomotor')
                         self.set_state(PyTango.DevState.FAULT)
-                        with self.attrLock:
-                            self.picomotorPosition = None
+                        self.set_status('Error reading picomotor')
+                        self.picomotor_position = None
 
                 # Read redpitaya:
-                with self.attrLock:
-                    try:
-                        self.info_stream('redpitaya check')
-                        if self.redpitayaChannel == 1:
-                            attr = self.redpitayaDevice.read_attribute('waveform1')
-                        else:
-                            attr = self.redpitayaDevice.read_attribute('waveform2')
-                        if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                            self.errorTrace = attr.value
+                if self.attributes['redpitaya'].read_event.is_set():
+                    attr = self.attributes['redpitaya'].get_attribute()
+                    if attr.quality == PyTango.AttrQuality.ATTR_VALID:
+                        with self.attr_lock:
+                            self.error_trace = attr.value
                             fref = 2.9985e9
                             Vpp = 0.8
-                            self.jitter = 1 / (2 * np.pi * fref) * self.errorTrace.std() / (Vpp / 2)
-                        else:
-                            self.errorTrace = None
-                            self.set_state(PyTango.DevState.FAULT)
-                        # if self.waitingForRedpitaya is False:
-                        #     self.waitingForRedpitaya = True
-                        #     if self.redpitayaChannel == 1:
-                        #         self.redpitayaDevice.read_attribute_asynch('waveform1', self.updateRedpitaya)
-                        #     else:
-                        #         self.redpitayaDevice.read_attribute_asynch('waveform2', self.updateRedpitaya)
-                    except Exception, ex:
-                        with self.streamLock:
-                            self.error_stream('Error reading redpitaya')
-                            self.error_stream(str(ex))
+                            self.jitter = 1 / (2 * np.pi * fref) * self.error_trace.std() / (Vpp / 2)
+                    else:
+                        self.error_stream('Error reading redpitaya')
                         self.set_state(PyTango.DevState.FAULT)
-                        self.errorTrace = None
+                        self.set_status('Error reading redpitaya')
+                        self.error_trace = None
                         self.jitter = None
 
-            with self.attrLock:
-                # Update parameters for the tracking state machine
-                self.halcyonTracking.modelock = self.modelock
-                self.halcyonTracking.jitter = self.jitter
-                self.halcyonTracking.errorFrequency = self.errorFrequency
-                self.halcyonTracking.piezoVoltage = self.piezoVoltage
-                # Update the state machine
-                self.halcyonTracking.stateHandlerDispatcher()
-            self.checkCommands()    # Check commands - there should be one from halcyonTracking
+            # If a picomotor write command has been issued, check if it is ready
+            #self.update_picomotor_write()
 
-            self.checkCommands(blockTime=waitTime)
+            with self.attr_lock:
+                # Update parameters for the tracking state machine:
+                self.halcyon_tracking.modelock = self.modelock
+                self.halcyon_tracking.jitter = self.jitter
+                self.halcyon_tracking.errorFrequency = self.error_frequency
+                self.halcyon_tracking.piezoVoltage = self.piezo_voltage
+                # Update the state machine:
+                self.halcyon_tracking.stateHandlerDispatcher()
+            self.check_commands()    # Check commands - there should be one from halcyonTracking
 
-    def faultHandler(self, prevState):
+            # with self.attr_lock:
+            #     # Update state depending on lockdown and tracking parameters
+            #     if self.halcyon_tracking.follow is True and self.halcyon_tracking.lockdown is True:
+            #         self.set_state(PyTango.DevState.ON)
+
+            # Check commands again, but with a short wait time
+            # The queue is probably empty now
+            self.check_commands(block_time=wait_time)
+
+    def fault_handler(self, prevState):
         """Handles the FAULT state. A problem has been detected.
         """
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream('Entering faultHandler')
-        handledStates = [PyTango.DevState.FAULT]
-        waitTime = 0.1
+        handled_states = [PyTango.DevState.FAULT]
+        wait_time = 0.1
         retries = 0
-        maxTries = 5
+        max_tries = 5
 
         # Will try to communicate with all devices
-        while self.stopStateThreadFlag is False:
-            if self.get_state() not in handledStates:
+        while self.stop_state_thread_flag is False:
+            if self.get_state() not in handled_states:
                 break
 
             # Starting with picomotor
-            with self.streamLock:
+            with self.stream_lock:
                 self.info_stream('Testing picomotor')
-            with self.attrLock:
+            with self.attr_lock:
                 try:
                     st = self.picomotorDevice.state()
                     if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
@@ -453,9 +448,9 @@ class HalcyonDS(PyTango.Device_4Impl):
                     break
 
             # Testing redpitaya
-            with self.streamLock:
+            with self.stream_lock:
                 self.info_stream('Testing redpitaya')
-            with self.attrLock:
+            with self.attr_lock:
                 try:
                     st = self.redpitayaDevice.state()
                     if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
@@ -468,9 +463,9 @@ class HalcyonDS(PyTango.Device_4Impl):
                     break
 
             # Testing ad7991
-            with self.streamLock:
+            with self.stream_lock:
                 self.info_stream('Testing AD7991')
-            with self.attrLock:
+            with self.attr_lock:
                 try:
                     st = self.ad7991Device.state()
                     if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
@@ -483,9 +478,9 @@ class HalcyonDS(PyTango.Device_4Impl):
                     break
 
             # Testing superlogics
-            with self.streamLock:
+            with self.stream_lock:
                 self.info_stream('Testing superlogics')
-            with self.attrLock:
+            with self.attr_lock:
                 try:
                     st = self.frequencyDevice.state()
                     if st in [PyTango.DevState.ON, PyTango.DevState.OFF, PyTango.DevState.RUNNING, PyTango.DevState.MOVING, PyTango.DevState.ALARM, PyTango.DevState.STANDBY]:
@@ -499,57 +494,63 @@ class HalcyonDS(PyTango.Device_4Impl):
 
             if self.get_state() == PyTango.DevState.FAULT:
                 retries += 1
-                if retries > maxTries:
+                if retries > max_tries:
                     self.set_state(PyTango.DevState.UNKNOWN)
-            self.checkCommands(blockTime=waitTime)
+            self.set_state(PyTango.DevState.FAULT)
+            while self.get_state() == PyTango.DevState.FAULT:
+                self.check_commands(block_time=wait_time)
 
-    def offHandler(self, prevState):
+    def off_handler(self, prevState):
         """Handles the OFF state. Does nothing, just goes back to ON.
         """
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream('Entering offHandler')
         self.set_state(PyTango.DevState.ON)
 
-    def checkCommands(self, blockTime=0):
+    def check_commands(self, block_time=0):
         """Checks the commandQueue for new commands. Must be called regularly.
         If the queue is empty the method exits immediately.
         """
-        with self.streamLock:
-            self.debug_stream('Entering checkCommands')
-            self.debug_stream(''.join(('Queue length: ', str(self.commandQueue.qsize()))))
-            self.debug_stream(''.join(('blockTime: ', str(blockTime))))
+        with self.stream_lock:
+            self.debug_stream('Entering check_commands')
+            self.debug_stream(''.join(('Queue length: ', str(self.command_queue.qsize()))))
+            self.debug_stream(''.join(('block_time: ', str(block_time))))
         try:
-            if blockTime == 0:
+            if block_time == 0:
                 # with self.streamLock:
                 # self.debug_stream('checkCommands: blockTime == 0')
-                cmd = self.commandQueue.get(block=False)
+                cmd = self.command_queue.get(block=False)
             else:
                 # with self.streamLock:
                 # self.debug_stream('checkCommands: blockTime != 0')
-                cmd = self.commandQueue.get(block=True, timeout=blockTime)
-#             with self.streamLock:
-#                 self.info_stream(str(cmd.command))
+                cmd = self.command_queue.get(block=True, timeout=block_time)
+            with self.stream_lock:
+                self.info_stream(str(cmd.command))
             if cmd.command == 'writeMotorPosition':
-                newPos = cmd.data
-                with self.streamLock:
-                    self.info_stream(''.join(('Write motor position ', str(newPos))))
-                with self.attrLock:
+                new_pos = cmd.data
+                with self.stream_lock:
+                    self.info_stream(''.join(('Write motor position ', str(new_pos))))
+                with self.attr_lock:
                     self.info_stream('apa!')
-                    self.picomotorDevice.write_attribute('motorposition0a1', newPos, wait=True)
-                with self.streamLock:
+                    self.attributes['picomotor'].attr_write(new_pos)
+                with self.stream_lock:
                     self.info_stream(''.join(('Write motor position done')))
 
             elif cmd.command == 'writeMotorPositionRelative':
                 steps = cmd.data
-                with self.streamLock:
+                t0 = time.time()
+                with self.stream_lock:
                     self.info_stream(''.join(('Checkcommands: Moving picomotor ', str(steps), ' steps')))
-                with self.attrLock:
-#                    self.picomotorDevice.write_attribute('CurrentMotor', 0, wait=False)
-                    self.picomotorDevice.command_inout('MoveCurrentMotorRelative', steps, wait=False)
+                with self.attr_lock:
+                    self.attributes['picomotor'].device_command('MoveCurrentMotorRelative', steps)
+
+                with self.stream_lock:
+                    self.debug_stream("Time spent writePicomotorRelative: {:.2f}s".format(time.time() - t0))
+                    self.debug_stream("-----------------------------------------------------------------")
 
             elif cmd.command == 'stop' or cmd.command == 'standby':
                 if self.get_state() not in [PyTango.DevState.INIT, PyTango.DevState.UNKNOWN]:
-                    with self.attrLock:
+                    with self.attr_lock:
                         self.picomotorDevice.command_inout('stop')
 
             elif cmd.command == 'off':
@@ -576,6 +577,8 @@ class HalcyonDS(PyTango.Device_4Impl):
                     self.set_state(PyTango.DevState.MOVING)
                     self.set_status(cmd.data)
 
+            self.command_queue.task_done()
+
         except Queue.Empty:
             # with self.streamLock:
             #     self.debug_stream('checkCommands: queue empty')
@@ -586,32 +589,36 @@ class HalcyonDS(PyTango.Device_4Impl):
 
     def updateFrequency(self, arg):
         attr = arg.argout[0]
-        with self.attrLock:
+        with self.attr_lock:
             if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                self.errorFrequency = attr.value
+                self.error_frequency = attr.value
+                self.errorFrequencyLastUpdate = time.time()
             else:
-                self.errorFrequency = None
+                self.error_frequency = None
                 self.set_state(PyTango.DevState.FAULT)
             self.waitingForFrequency = False
 
-    def updatePiezovoltage(self, arg):
+    def updatePiezoVoltage(self, arg):
         attr = arg.argout[0]
-        with self.attrLock:
+        with self.attr_lock:
             if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                self.piezoVoltage = attr.value * 10
+                self.piezo_voltage = attr.value * 100
+                self.piezoVoltageLastUpdate = time.time()
             else:
-                self.piezoVoltage = None
+                self.piezo_voltage = None
                 self.set_state(PyTango.DevState.FAULT)
             self.waitingForVoltage = False
+            self.info_stream("".join(("PiezoVoltage type: ", str(type(self.piezo_voltage)))))
 
     def updateModelock(self, arg):
         attr = arg.argout[0]
-        with self.attrLock:
+        with self.attr_lock:
             if attr.quality == PyTango.AttrQuality.ATTR_VALID:
                 if attr.value > 2.0:
                     self.modelock = True
                 else:
                     self.modelock = False
+                self.modelockLastUpdate = time.time()
             else:
                 self.modelock = None
                 self.set_state(PyTango.DevState.FAULT)
@@ -620,36 +627,38 @@ class HalcyonDS(PyTango.Device_4Impl):
     def updatePicomotor(self, arg):
         self.info_stream('Updating picomotor position')
         attr = arg.argout[0]
-        with self.attrLock:
+        with self.attr_lock:
             if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                self.picomotorPosition = attr.value
+                self.picomotor_position = attr.value
+                self.picomotorLastUpdate = time.time()
             else:
-                self.picomotorPosition = None
+                self.picomotor_position = None
                 self.set_state(PyTango.DevState.FAULT)
+                self.set_status("Picomotor read INVALID")
             self.waitingForPicomotor = False
 
-    def updatePicomotorWrite(self, arg):
-        attr = arg.argout[0]
-        with self.attrLock:
-            if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                self.picomotorPosition = attr.value
-            else:
-                self.picomotorPosition = None
-                self.set_state(PyTango.DevState.FAULT)
-            self.waitingForPicomotor = False
+    def update_picomotor_write(self):
+        with self.attr_lock:
+            if self.waitingForPicomotorWrite is True:
+                try:
+                    self.picomotorDevice.command_inout_reply(self.waitingForPicomotorId)
+                    self.waitingForPicomotorWrite = False
+                    self.waitingForPicomotorId = None
+                except PyTango.AsynReplyNotArrived:
+                    pass
 
     def updateRedpitaya(self, arg):
         attr = arg.argout[0]
-        with self.attrLock:
+        with self.attr_lock:
             if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                self.errorTrace = attr.value
+                self.error_trace = attr.value
                 # Jitter calculation according to kmlabs white paper
                 fref = 2.9985e9
                 Vpp = 0.8
-                self.jitter = 1 / (2 * np.pi * fref) * self.errorTrace.std() / (Vpp / 2)
-
+                self.jitter = 1 / (2 * np.pi * fref) * self.error_trace.std() / (Vpp / 2)
+                self.redpitayaLastUpdate = time.time()
             else:
-                self.errorTrace = None
+                self.error_trace = None
                 self.jitter = None
                 self.set_state(PyTango.DevState.FAULT)
             self.waitingForRedpitaya = False
@@ -666,10 +675,10 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     ErrorFrequency attribute
 # ------------------------------------------------------------------
     def read_ErrorFrequency(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading error frequency')))
-        with self.attrLock:
-            attr_read = self.errorFrequency
+        with self.attr_lock:
+            attr_read = self.error_frequency
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = 0.0
@@ -687,10 +696,10 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     PicomotorPosition attribute
 # ------------------------------------------------------------------
     def read_PicomotorPosition(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading picomotor position')))
-        with self.attrLock:
-            attr_read = self.picomotorPosition
+        with self.attr_lock:
+            attr_read = self.picomotor_position
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = 0.0
@@ -700,7 +709,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         self.info_stream(''.join(('Writing picomotor position')))
         data = (attr.get_write_value())
         cmdMsg = HalcyonCommand('writeMotorPosition', data)
-        self.commandQueue.put(cmdMsg)
+        self.command_queue.put(cmdMsg)
 
     def is_PicomotorPosition_allowed(self, req_type):
         if self.get_state() in [PyTango.DevState.INIT,
@@ -714,10 +723,10 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     PicomotorFollow attribute
 # ------------------------------------------------------------------
     def read_PicomotorFollow(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading picomotor follow')))
-        with self.attrLock:
-            attr_read = self.halcyonTracking.follow
+        with self.attr_lock:
+            attr_read = self.halcyon_tracking.follow
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = 0.0
@@ -725,11 +734,11 @@ class HalcyonDS(PyTango.Device_4Impl):
 
     def write_PicomotorFollow(self, attr):
         self.info_stream(''.join(('Writing picomotor follow')))
-        with self.attrLock:
+        with self.attr_lock:
             data = (attr.get_write_value())
 #            self.picomotorFollowParameters.follow = data
             self.info_stream(''.join(('Setting halcyonTracking.follow to ', str(data))))
-            self.halcyonTracking.follow = data
+            self.halcyon_tracking.follow = data
 
     def is_PicomotorFollow_allowed(self, req_type):
         if self.get_state() in []:
@@ -743,9 +752,9 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     Modelocked attribute
 # ------------------------------------------------------------------
     def read_Modelocked(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading picomotor position')))
-        with self.attrLock:
+        with self.attr_lock:
             attr_read = self.modelock
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
@@ -766,10 +775,10 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     PiezoVoltage attribute
 # ------------------------------------------------------------------
     def read_PiezoVoltage(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading piezo voltage')))
-        with self.attrLock:
-            attr_read = self.piezoVoltage
+        with self.attr_lock:
+            attr_read = self.piezo_voltage
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = 0.0
@@ -787,9 +796,9 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     Jitter attribute
 # ------------------------------------------------------------------
     def read_Jitter(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading jitter')))
-        with self.attrLock:
+        with self.attr_lock:
             self.info_stream(''.join(('Jitter: ', str(self.jitter))))
             attr_read = self.jitter
             q = PyTango.AttrQuality.ATTR_VALID
@@ -797,7 +806,7 @@ class HalcyonDS(PyTango.Device_4Impl):
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 q = PyTango.AttrQuality.ATTR_INVALID
                 attr_read = 0.0
-            if self.errorFrequency > 0:
+            if self.error_frequency > 0:
                 self.info_stream('Jitter INVALID')
                 q = PyTango.AttrQuality.ATTR_INVALID
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
@@ -817,10 +826,10 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     SampleTime attribute
 # ------------------------------------------------------------------
     def read_SampleTime(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading sample time')))
-        with self.attrLock:
-            attr_read = self.sampleTime
+        with self.attr_lock:
+            attr_read = self.sample_time
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = 0.0
@@ -838,21 +847,21 @@ class HalcyonDS(PyTango.Device_4Impl):
 #     ErrorTrace attribute
 # ------------------------------------------------------------------
     def read_ErrorTrace(self, attr):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('Reading ErrorTrace')))
-        with self.attrLock:
-            attr_read = np.copy(self.errorTrace)
-            with self.streamLock:
+        with self.attr_lock:
+            attr_read = np.copy(self.error_trace)
+            with self.stream_lock:
                 self.debug_stream(''.join(('In read_ErrorTrace: attr_read')))
                 self.debug_stream(''.join(('In read_ErrorTrace: attr_read type ', str(type(attr_read)))))
                 self.debug_stream(''.join(('In read_ErrorTrace: attr_read shape ', str(attr_read.shape))))
             if attr_read is None:
                 attr.set_quality(PyTango.AttrQuality.ATTR_INVALID)
                 attr_read = np.array([0.0])
-                with self.streamLock:
+                with self.stream_lock:
                     self.debug_stream(''.join(('In read_ErrorTrace: attr_read==None')))
             attr.set_value(attr_read, attr_read.shape[0])
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(('exit read_ErrorTrace')))
 
     def is_ErrorTrace_allowed(self, req_type):
@@ -876,10 +885,10 @@ class HalcyonDS(PyTango.Device_4Impl):
 #
 # ------------------------------------------------------------------
     def On(self):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(("In ", self.get_name(), "::On")))
         cmdMsg = HalcyonCommand('on')
-        self.commandQueue.put(cmdMsg)
+        self.command_queue.put(cmdMsg)
 
 # ---- On command State Machine -----------------
     def is_On_allowed(self):
@@ -896,10 +905,10 @@ class HalcyonDS(PyTango.Device_4Impl):
 #
 # ------------------------------------------------------------------
     def Stop(self):
-        with self.streamLock:
+        with self.stream_lock:
             self.info_stream(''.join(("In ", self.get_name(), "::Stop")))
         cmdMsg = HalcyonCommand('stop')
-        self.commandQueue.put(cmdMsg)
+        self.command_queue.put(cmdMsg)
 
 # ---- Stop command State Machine -----------------
     def is_Stop_allowed(self):
@@ -963,6 +972,10 @@ class HalcyonDSClass(PyTango.DeviceClass):
             [PyTango.DevDouble,
              "Piezo voltage range in the center where no further adjustments are done",
              [10]],
+        'maxNumberAdjusts':
+            [PyTango.DevLong,
+             "Maximum number of adjustment attempts done with picomotor before giving up",
+             [30]],
     }
 
     #     Command definitions

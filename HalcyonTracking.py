@@ -40,7 +40,7 @@ class HalcyonDriver:
 
 
 class HalcyonTracking(object):
-    def __init__(self, cmdQueue, lock):
+    def __init__(self, cmdQueue):
         # Configuration parameters:
         self.follow = False
         self.search = False
@@ -49,8 +49,8 @@ class HalcyonTracking(object):
         self.centerPiezoVoltage = 50
         self.piezoDeadband = 10
         self.updateDeadtime = 2.0
-        self.moveSteps = 2
-        self.maxNumberAdjusts = 5  # Maximum number of adjusts of picomotor before going back to idle
+        self.moveSteps = 1
+        self.maxNumberAdjusts = 30  # Maximum number of adjusts of picomotor before going back to idle
         self.maxNumberFailedAdjusts = 10  # Maxmimum number of adjusts that overflowed the maxNumberAdjusts before declaring the lock non-functional
         self.picomotorAverageTime = 60.0  # Collecting picomotor positions with this rolling window time
 
@@ -67,7 +67,6 @@ class HalcyonTracking(object):
         self.modelock = False
         self.picomotorHistory = [(self.lastUpdateTime, 0)]
         self.lockdown = False
-        self.trackLock = lock
 
         # State machine settings
         self.halcyonState = 'nomodelock'
@@ -166,12 +165,13 @@ class HalcyonTracking(object):
             self.halcyonState = 'nofreqlock'        # Go to nofreqlock even if we are frequency locked. It will then switch to idle state next pass
         else:
             # Remain in lockdown until someone switches to follow
-            cmdMsg = HalcyonCommand('alarm', 'Adjustment lockdown. Too many attempts.')
+            cmdMsg = HalcyonCommand('alarm', 'Adjustment lockdown. Too many attempts. Toggle PicomotorFollow to clear.')
             self.q.put(cmdMsg)
 
     def adjustingHandler(self):
         logging.info('Entering adjustingHandler')
         logging.info(''.join(('Adjustment #', str(self.adjustNumber))))
+        t0 = time.time()
         if self.modelock is False or self.modelock is None:
             self.halcyonState = 'nomodelock'
         elif self.errorFrequency > 0 or self.errorFrequency is None:
@@ -227,6 +227,7 @@ class HalcyonTracking(object):
                     self.failedAdjustNumber = 0
                     cmdMsg = HalcyonCommand('alarm', 'Entering lockdown')
                     self.q.put(cmdMsg)
+            logging.info("Adjustment time spent: {:.1f}s".format(time.time() - t0))
 
     def searchingHandler(self):
         """ Function for searching out a frequency lock by moving the picomotor
@@ -241,3 +242,4 @@ class HalcyonTracking(object):
         elif self.errorFrequency == 0:
             # If we have frequency lock go to state 'idle'
             self.halcyonState = 'idle'
+
