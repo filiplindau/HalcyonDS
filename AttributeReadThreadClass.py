@@ -34,6 +34,7 @@ class DeviceWatchdogClass(object):
             if self.watchdog is not None:
                 self.watchdog.cancel()
             self.watchdog = threading.Timer(self.timeout, self.timeout_watchdog)
+            self.watchdog.start()
 
     def timeout_watchdog(self):
         self.init_device()
@@ -47,32 +48,60 @@ class DeviceWatchdogClass(object):
 
 class AttributeClass(object):
 
-    def __init__(self, name, device, interval, getInfo=False):
+    def __init__(self, attribute_name, device_name, interval, getInfo=False, watchdog_timeout=10.0):
         super(AttributeClass, self).__init__()
-        self.name = name
-        self.device = device
+        self.attribute_name = attribute_name
+        self.device_name = device_name
         self.interval = interval
         self.get_info_flag = getInfo
         self._wvalue = None
         self._device_command = None
+        self.attribute_proxy = None
+
+        self.watchdog_timeout = watchdog_timeout
+        self.watchdog_timer = None
         
         self.read_event = threading.Event()
         self.attr_lock = threading.Lock()
 
         self.last_read = time.time()
         self.attr = None
-        self.read_thread = threading.Thread(name=self.name, target=self.attr_read)
+        self.read_thread = threading.Thread(name=self.attribute_name, target=self.attr_read)
         self.stop_thread = False
 
         self.start_read()
 
+    def init_attribute(self):
+        with self.attr_lock:
+            self.attribute_proxy = pt.AttributeProxy(''.join((self.device_name, '/', self.attribute_name)))
+
+    def reset_watchdog(self):
+        with self.attr_lock:
+            if self.watchdog_timer is not None:
+                self.watchdog_timer.cancel()
+            self.watchdog_timer = threading.Timer(self.watchdog_timeout, self.timeout_watchdog_function)
+            self.watchdog_timer.start()
+
+    def timeout_watchdog_function(self):
+        self.init_attribute()
+        self.reset_watchdog()
+
+    def stop_watchdog(self):
+        with self.attr_lock:
+            if self.watchdog_timer is not None:
+                self.watchdog_timer.cancel()
+
     def attr_read(self):
+        if self.attribute_proxy is None:
+            self.init_attribute()
+        self.reset_watchdog()
+
         reply_ready = True
         while self.stop_thread is False:
             if self.get_info_flag is True:
                 self.get_info_flag = False
                 try:
-                    self.attr_info = self.device.get_attribute_config(self.name)
+                    self.attr_info = self.attribute_proxy.get_config()
 
                 except pt.DevFailed, e:
                     if e[0].reason == 'API_DeviceTimeOut':
@@ -89,7 +118,7 @@ class AttributeClass(object):
             if t-self.last_read > self.interval:
                 self.last_read = t
                 try:
-                    read_attr_id = self.device.read_attribute_asynch(self.name)
+                    read_attr_id = self.attribute_proxy.read_asynch()
 
                     reply_ready = False
                 except pt.DevFailed, e:
@@ -115,9 +144,10 @@ class AttributeClass(object):
                 while reply_ready is False and self.stop_thread is False:
                     try:
                         with self.attr_lock:
-                            self.attr = self.device.read_attribute_reply(read_attr_id)
+                            self.attr = self.attribute_proxy.read_reply(read_attr_id)
                         reply_ready = True
                         self.read_event.set()
+                        self.reset_watchdog()
                         # print 'signal emitted', self.attr.value.shape
                         # Read only once if interval = None:
                         if self.interval is None:
@@ -144,16 +174,16 @@ class AttributeClass(object):
                     self._device_command = None
                     try:
                         if cmd_arg is None:
-                            self.device.command_inout(cmd)
+                            self.attribute_proxy.get_device_proxy().command_inout(cmd)
                         else:
-                            self.device.command_inout(cmd, cmd_arg)
+                            self.attribute_proxy.get_device_proxy().command_inout(cmd, cmd_arg)
                     except:
                         pass
 
             if self._wvalue is not None:
                 with self.attr_lock:
                     try:
-                        self.device.write_attribute(self.name, self._wvalue)
+                        self.attribute_proxy.write(self._wvalue)
                     except:
                         pass
                     finally:
@@ -163,6 +193,9 @@ class AttributeClass(object):
                 time.sleep(self.interval)
             else:
                 time.sleep(1)
+
+        self.stop_watchdog()
+
         print self.name, ' waiting for final reply'
         final_timeout = 1.0  # Wait max 1 s
         final_start_time = time.time()
@@ -170,7 +203,7 @@ class AttributeClass(object):
         while reply_ready is False and final_timeout_flag is False:
             try:
                 with self.attr_lock:
-                    self.attr = self.device.read_attribute_reply(read_attr_id)
+                    self.attr = self.attribute_proxy.read_reply(read_attr_id)
                 reply_ready = True
                 self.read_event.set()
             except Exception, e:

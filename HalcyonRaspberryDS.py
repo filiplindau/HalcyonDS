@@ -162,7 +162,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         with self.stream_lock:
             self.info_stream('Entering unknownHandler')
         connection_timeout = 1.0
-        self.set_status('Connecting to frequency counter, labjack, and picomotor')
+        self.set_status('Connecting to frequency counter, redpitaya, ad7991, and picomotor')
 
         # Need to connect to frequency counter, ad7991, redpitaya
         # and picomotor
@@ -177,18 +177,30 @@ class HalcyonDS(PyTango.Device_4Impl):
                     self.error_stream(str(ex))
                 self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create ad7991 device')
+            # try:
+            #     self.attributes['modelock'].stop_read()
+            # except KeyError:
+            #     pass
+            # self.attributes['modelock'] = AttributeClass(''.join(('channel', str(self.ad7991ModelockChannel))),
+            #                                              self.devices['ad7991'], 0.3)
+            # try:
+            #     self.attributes['piezo_voltage'].stop_read()
+            # except KeyError:
+            #     pass
+            # self.attributes['piezo_voltage'] = AttributeClass(''.join(('channel', str(self.ad7991PiezoChannel))),
+            #                                                   self.devices['ad7991'], 0.3)
             try:
                 self.attributes['modelock'].stop_read()
             except KeyError:
                 pass
             self.attributes['modelock'] = AttributeClass(''.join(('channel', str(self.ad7991ModelockChannel))),
-                                                         self.devices['ad7991'], 0.3)
+                                                         str(self.ad7991DeviceName), 0.3)
             try:
                 self.attributes['piezo_voltage'].stop_read()
             except KeyError:
                 pass
             self.attributes['piezo_voltage'] = AttributeClass(''.join(('channel', str(self.ad7991PiezoChannel))),
-                                                              self.devices['ad7991'], 0.3)
+                                                              str(self.ad7991DeviceName), 0.3)
 
             # Frequency counter:
             try:
@@ -200,11 +212,16 @@ class HalcyonDS(PyTango.Device_4Impl):
                     self.error_stream(str(ex))
                 self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create frequency counter device')
+            # try:
+            #     self.attributes['error_frequency'].stop_read()
+            # except KeyError:
+            #     pass
+            # self.attributes['error_frequency'] = AttributeClass('frequency', self.devices['frequency'], 0.3)
             try:
                 self.attributes['error_frequency'].stop_read()
             except KeyError:
                 pass
-            self.attributes['error_frequency'] = AttributeClass('frequency', self.devices['frequency'], 0.3)
+            self.attributes['error_frequency'] = AttributeClass('frequency', str(self.frequencyDeviceName), 0.3)
 
             # Picomotor
             try:
@@ -215,11 +232,16 @@ class HalcyonDS(PyTango.Device_4Impl):
                     self.error_stream(str(ex))
                 self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create picomotor device')
+            # try:
+            #     self.attributes['picomotor'].stop_read()
+            # except KeyError:
+            #     pass
+            # self.attributes['picomotor'] = AttributeClass('MotorPosition0A1', self.devices['picomotor'], 0.3)
             try:
                 self.attributes['picomotor'].stop_read()
             except KeyError:
                 pass
-            self.attributes['picomotor'] = AttributeClass('MotorPosition0A1', self.devices['picomotor'], 0.3)
+            self.attributes['picomotor'] = AttributeClass('MotorPosition0A1', str(self.picomotorDeviceName), 0.3)
 
             # RedPitaya
             try:
@@ -230,14 +252,23 @@ class HalcyonDS(PyTango.Device_4Impl):
                     self.error_stream(str(ex))
                 self.check_commands(block_time=connection_timeout)
                 self.set_status('Could not create redpitaya device')
+            # try:
+            #     self.attributes['redpitaya'].stop_read()
+            # except KeyError:
+            #     pass
+            # if self.redpitayaChannel == 1:
+            #     self.attributes['redpitaya'] = AttributeClass('waveform1', self.devices['redpitaya'], 0.3)
+            # else:
+            #     self.attributes['redpitaya'] = AttributeClass('waveform2', self.devices['redpitaya'], 0.3)
+
             try:
                 self.attributes['redpitaya'].stop_read()
             except KeyError:
                 pass
             if self.redpitayaChannel == 1:
-                self.attributes['redpitaya'] = AttributeClass('waveform1', self.devices['redpitaya'], 0.3)
+                self.attributes['redpitaya'] = AttributeClass('waveform1', str(self.redpitayaDeviceName), 0.3)
             else:
-                self.attributes['redpitaya'] = AttributeClass('waveform2', self.devices['redpitaya'], 0.3)
+                self.attributes['redpitaya'] = AttributeClass('waveform2', str(self.redpitayaDeviceName), 0.3)
 
             self.set_state(PyTango.DevState.INIT)
             break
@@ -316,7 +347,7 @@ class HalcyonDS(PyTango.Device_4Impl):
         """
         with self.stream_lock:
             self.info_stream('Entering onHandler')
-        handled_states = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING]
+        handled_states = [PyTango.DevState.ON, PyTango.DevState.ALARM, PyTango.DevState.MOVING, PyTango.DevState.FAULT]
         wait_time = 0.1
         self.set_status('On')
         while self.stop_state_thread_flag is False:
@@ -330,18 +361,18 @@ class HalcyonDS(PyTango.Device_4Impl):
                 self.info_stream('Checking devices')
                 # Modelock status
                 if self.attributes['modelock'].read_event.is_set():
-                        attr = self.attributes['modelock'].get_attribute()
-                        if attr.quality == PyTango.AttrQuality.ATTR_VALID:
-                            with self.attr_lock:
-                                if attr.value > 2.0:
-                                    self.modelock = True
-                                else:
-                                    self.modelock = False
-                        else:
-                            self.error_stream('Error reading modelock')
-                            self.set_state(PyTango.DevState.FAULT)
-                            self.set_status('Error reading modelock')
-                            self.modelock = None
+                    attr = self.attributes['modelock'].get_attribute()
+                    if attr.quality == PyTango.AttrQuality.ATTR_VALID:
+                        with self.attr_lock:
+                            if attr.value > 2.0:
+                                self.modelock = True
+                            else:
+                                self.modelock = False
+                    else:
+                        self.error_stream('Error reading modelock')
+                        self.set_state(PyTango.DevState.FAULT)
+                        self.set_status('Error reading modelock')
+                        self.modelock = None
 
                 # Piezo voltage
                 if self.attributes['piezo_voltage'].read_event.is_set():
