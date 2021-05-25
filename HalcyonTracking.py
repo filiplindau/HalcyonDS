@@ -95,7 +95,7 @@ class HalcyonTracking(object):
     def idleHandler(self):
         """ Function for normal state when the laser is modelocked and frequency locked,
         and also within piezo limits. Checks status of modelock, freqlock, and piezo."""
-        logging.info('Entering idleHandler')
+        logging.debug('Entering idleHandler')
         if self.modelock is False or self.modelock is None:
             self.halcyonState = 'nomodelock'
         elif self.errorFrequency > 0 or self.errorFrequency is None:
@@ -107,6 +107,7 @@ class HalcyonTracking(object):
                     # If the device was in lockdown mode
                     # and then was turned back to follow (someone issued
                     # wrote follow=True) we exit lockdown mode.
+                    logging.info("Exit lockdown")
                     self.lockdown = False
                     cmdMsg = HalcyonCommand('on')
                     self.q.put(cmdMsg)
